@@ -20,4 +20,6 @@ This project is a GUI-based simulation of a smart assistive wheelchair designed 
 
 ## ▶ How to Run
 ```bash
+pip install -r requirements.txt
 python wheelchair_gui.py
+
