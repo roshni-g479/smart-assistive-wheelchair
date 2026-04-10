@@ -1,0 +1,437 @@
+import pygame
+import math
+import heapq
+import random
+import sys
+
+
+WIDTH, HEIGHT = 800, 600
+FPS = 60
+CELL_SIZE = 20  
+
+# Color definitions (RGB)
+WHITE = (250, 250, 250)
+BLACK = (10, 10, 10)
+BLUE = (30, 100, 255)       # Wheelchair
+RED = (230, 50, 50)         # Obstacles
+GREEN = (40, 200, 40)       # Destination Goal
+DARK_GRAY = (60, 60, 60)
+LIGHT_GRAY = (220, 220, 220)
+PATH_COLOR = (255, 165, 0)  # Orange for path visualization
+BTN_COLOR = (100, 100, 100)
+BTN_HOVER = (150, 150, 150)
+UI_BG = (255, 255, 255, 200)
+
+# ==========================================
+# 2. UI COMPONENTS (Classes)
+# ==========================================
+class Button:
+    def __init__(self, x, y, width, height, text, action):
+        self.rect = pygame.Rect(x, y, width, height)
+        self.text = text
+        self.action = action
+        self.is_hovered = False
+
+    def draw(self, surface, font):
+        # Change color if hovered
+        color = BTN_HOVER if self.is_hovered else BTN_COLOR
+        pygame.draw.rect(surface, color, self.rect, border_radius=5)
+        pygame.draw.rect(surface, BLACK, self.rect, 2, border_radius=5)
+        
+        # Render text
+        text_surf = font.render(self.text, True, WHITE)
+        text_rect = text_surf.get_rect(center=self.rect.center)
+        surface.blit(text_surf, text_rect)
+
+    def handle_event(self, event):
+        # Update hover state
+        if event.type == pygame.MOUSEMOTION:
+            self.is_hovered = self.rect.collidepoint(event.pos)
+        # Click action
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.is_hovered:
+                self.action()
+
+class Obstacle:
+    def __init__(self, x, y, w, h):
+        self.rect = pygame.Rect(x, y, w, h)
+
+    def draw(self, surface):
+        pygame.draw.rect(surface, RED, self.rect, border_radius=3)
+        pygame.draw.rect(surface, BLACK, self.rect, 1, border_radius=3)
+
+
+class Wheelchair:
+    def __init__(self, start_x, start_y):
+        self.size = 16  # Slightly smaller than cell size (20) to fit through gaps easily
+        self.pos = pygame.math.Vector2(start_x, start_y)
+        self.rect = pygame.Rect(self.pos.x - self.size/2, self.pos.y - self.size/2, self.size, self.size)
+        
+        # Movement physics
+        self.speed = 3.0
+        self.angle = 0.0  # Used for mapping drawing direction
+        self.emergency_stop = False
+        self.path_index = 0
+
+    def check_collisions(self, obstacles, future_pos):
+        # 1. Screen Boundary Collision Check
+        if (future_pos.x - self.size/2 < 0 or future_pos.x + self.size/2 > WIDTH or 
+            future_pos.y - self.size/2 < 0 or future_pos.y + self.size/2 > HEIGHT):
+            return True 
+
+        # 2. Obstacle Collision Check
+        temp_rect = pygame.Rect(future_pos.x - self.size/2, future_pos.y - self.size/2, self.size, self.size)
+        for obs in obstacles:
+            if temp_rect.colliderect(obs.rect):
+                return True
+        return False
+
+    def move_manual(self, keys, obstacles):
+        if self.emergency_stop:
+            return  # Disable controls if stopped
+
+        move = pygame.math.Vector2(0, 0)
+        if keys[pygame.K_w]: move.y -= 1
+        if keys[pygame.K_s]: move.y += 1
+        if keys[pygame.K_a]: move.x -= 1
+        if keys[pygame.K_d]: move.x += 1
+
+        if move.length() > 0:
+            move.scale_to_length(self.speed)
+            # Update visual rotation angle smoothly (in degrees)
+            target_angle = math.degrees(math.atan2(-move.y, move.x)) - 90
+            self.angle = target_angle 
+
+        future_pos = self.pos + move
+        
+        # Move only if no collision. If collision happens -> trigger emergency stop
+        if self.check_collisions(obstacles, future_pos):
+            self.emergency_stop = True
+        else:
+            self.pos = future_pos
+            self.rect.center = self.pos
+
+    def move_auto(self, path, obstacles):
+        if self.emergency_stop or not path or self.path_index >= len(path):
+            return
+
+        target_pos = path[self.path_index]
+        direction = target_pos - self.pos
+
+        # If close enough to waypoint, move to next waypoint
+        if direction.length() < self.speed:
+            self.pos = target_pos
+            self.path_index += 1
+        else:
+            # Move towards waypoint based on speed
+            direction.scale_to_length(self.speed)
+            future_pos = self.pos + direction
+            
+            # Predict and map angle visual direction
+            target_angle = math.degrees(math.atan2(-direction.y, direction.x)) - 90
+            self.angle = target_angle
+
+            if self.check_collisions(obstacles, future_pos):
+                self.emergency_stop = True
+            else:
+                self.pos += direction
+
+        self.rect.center = self.pos
+
+    def draw(self, surface):
+        # Main Body (Blue Square)
+        pygame.draw.rect(surface, BLUE, self.rect, border_radius=4)
+        
+        # Indicator line to show front/turning direction
+        end_x = self.pos.x + math.sin(math.radians(self.angle)) * 12
+        end_y = self.pos.y + math.cos(math.radians(self.angle)) * 12
+        pygame.draw.line(surface, WHITE, self.pos, (end_x, end_y), 3)
+
+# 4. PATHFINDING SYSTEM (A* Algorithm)
+class Pathfinding:
+    @staticmethod
+    def heuristic(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1]) 
+
+    @staticmethod
+    def is_valid_cell(x, y, obstacles):
+        rect = pygame.Rect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+        for obs in obstacles:
+            if rect.colliderect(obs.rect):
+                return False
+        return True
+
+    @staticmethod
+    def get_neighbors(node, obstacles, cols, rows):
+        neighbors = []
+        # Allow 8 direction movements (Cardinal + Diagonals)
+        directions = [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1), (1, -1), (-1, 1)]
+        
+        for dx, dy in directions:
+            nx, ny = node[0] + dx, node[1] + dy
+            if 0 <= nx < cols and 0 <= ny < rows:
+                if Pathfinding.is_valid_cell(nx, ny, obstacles):
+                    # Prevent corner cutting on diagonals
+                    if dx != 0 and dy != 0:
+                        if not Pathfinding.is_valid_cell(node[0]+dx, node[1], obstacles) or \
+                           not Pathfinding.is_valid_cell(node[0], node[1]+dy, obstacles):
+                            continue # Blocks diagonal if adjacent cardinal cells are blocked
+                    neighbors.append((nx, ny))
+        return neighbors
+
+    @staticmethod
+    def a_star(start_pos, goal_pos, obstacles):
+        cols, rows = WIDTH // CELL_SIZE, HEIGHT // CELL_SIZE
+        
+        
+        start_node = (int(start_pos.x // CELL_SIZE), int(start_pos.y // CELL_SIZE))
+        goal_node = (int(goal_pos.x // CELL_SIZE), int(goal_pos.y // CELL_SIZE))
+
+        
+        start_node = (max(0, min(cols-1, start_node[0])), max(0, min(rows-1, start_node[1])))
+        goal_node = (max(0, min(cols-1, goal_node[0])), max(0, min(rows-1, goal_node[1])))
+
+        if not Pathfinding.is_valid_cell(goal_node[0], goal_node[1], obstacles):
+            return [] 
+
+        open_set = []
+        heapq.heappush(open_set, (0, start_node))
+        came_from = {}
+        
+        g_score = {start_node: 0}
+        
+        while open_set:
+            current = heapq.heappop(open_set)[1]
+            
+            if current == goal_node:
+                # Reconstruct Path
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.reverse()
+                
+                return [pygame.math.Vector2(p[0]*CELL_SIZE + CELL_SIZE/2, p[1]*CELL_SIZE + CELL_SIZE/2) for p in path]
+                
+            for neighbor in Pathfinding.get_neighbors(current, obstacles, cols, rows):
+                # Diagonal moves cost roughly 1.4, Straight 1.0
+                cost = 1.414 if (neighbor[0] != current[0] and neighbor[1] != current[1]) else 1.0
+                tentative_g_score = g_score[current] + cost
+                
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score = tentative_g_score + Pathfinding.heuristic(neighbor, goal_node)
+                    heapq.heappush(open_set, (f_score, neighbor))
+                    
+        return [] # Empty list indicating no valid path
+
+# ==========================================
+# 5. MAIN GAME LOOP
+# ==========================================
+def create_random_obstacles(count):
+    obstacles = []
+    
+    # 1. Add Environment Borders (Leaving top 60px for UI)
+    obstacles.append(Obstacle(0, 60, WIDTH, 10))
+    obstacles.append(Obstacle(0, HEIGHT-10, WIDTH, 10))
+    obstacles.append(Obstacle(0, 60, 10, HEIGHT-60))
+    obstacles.append(Obstacle(WIDTH-10, 60, 10, HEIGHT-60))
+    
+    # 2. Add Pre-defined Architectural Walls
+    obstacles.append(Obstacle(200, 120, 40, 200))
+    obstacles.append(Obstacle(500, 300, 200, 40))
+    obstacles.append(Obstacle(100, 450, 300, 40))
+
+    # 3. Add Random Scattered Blocks
+    for _ in range(count):
+        w = random.randint(40, 100)
+        h = random.randint(40, 100)
+        x = random.randint(10, WIDTH - w - 10)
+        y = random.randint(70, HEIGHT - h - 10)
+        
+        # Don't spawn blocking the starting area (Top Left around 80, 80) or Default Goal (700, 500)
+        if pygame.Rect(x, y, w, h).colliderect(pygame.Rect(40, 70, 80, 80)) or \
+           pygame.Rect(x, y, w, h).colliderect(pygame.Rect(WIDTH-120, HEIGHT-120, 40, 40)):
+            continue
+        obstacles.append(Obstacle(x, y, w, h))
+
+    return obstacles
+
+def main():
+    # Initialize Core Setup
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Smart Wheelchair Navigation System")
+    clock = pygame.time.Clock()
+    
+    # Fonts
+    font = pygame.font.SysFont('Arial', 18, bold=True)
+    big_font = pygame.font.SysFont('Arial', 50, bold=True)
+
+    # Instantiate World Elements
+    obstacles = create_random_obstacles(10)
+    wheelchair = Wheelchair(80, 80)
+    goal_pos = pygame.math.Vector2(WIDTH - 100, HEIGHT - 100)
+    
+    # State Trackers
+    mode = "MANUAL"
+    show_grid = False
+    active_path = []
+    
+    def reset_system():
+        """Resets variables cleanly back to start values."""
+        nonlocal active_path, goal_pos, mode, obstacles
+        obstacles = create_random_obstacles(10)
+        wheelchair.pos = pygame.math.Vector2(80, 80)
+        wheelchair.emergency_stop = False
+        goal_pos = pygame.math.Vector2(WIDTH - 100, HEIGHT - 100)
+        active_path = []
+        wheelchair.path_index = 0
+        wheelchair.rect.center = wheelchair.pos
+
+    def toggle_mode():
+        nonlocal mode
+        mode = "AUTO" if mode == "MANUAL" else "MANUAL"
+
+    reset_btn = Button(WIDTH - 120, 10, 100, 40, "RESET", reset_system)
+    mode_btn = Button(10, 10, 150, 40, f"MODE: {mode}", toggle_mode)
+
+    running = True
+    while running:
+        clock.tick(FPS)
+        
+        # --- PHASE 1: EVENT HANDLING --- 
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            
+            reset_btn.handle_event(event)
+            mode_btn.handle_event(event)
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_m:
+                    # Toggle between "MANUAL" and "AUTO"
+                    mode = "AUTO" if mode == "MANUAL" else "MANUAL"
+                elif event.key == pygame.K_g:
+                    # Toggle Grid Viz
+                    show_grid = not show_grid
+            
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                # User clicked to set new goal (only below UI bar at y=60)
+                if event.pos[1] > 60 and not reset_btn.rect.collidepoint(event.pos) and not mode_btn.rect.collidepoint(event.pos):
+                    click_pos = pygame.math.Vector2(event.pos)
+                    # Quickly check to ensure they didn't click inside an obstacle
+                    valid = True
+                    temp_rect = pygame.Rect(click_pos.x-10, click_pos.y-10, 20, 20)
+                    for obs in obstacles:
+                        if temp_rect.colliderect(obs.rect):
+                            valid = False
+                            break
+                    
+                    if valid:
+                        goal_pos = click_pos
+                        active_path = Pathfinding.a_star(wheelchair.pos, goal_pos, obstacles)
+                        wheelchair.path_index = 0
+            
+            # Allow smooth dragging to move the destination
+            if event.type == pygame.MOUSEMOTION and pygame.mouse.get_pressed()[0]:
+                 if event.pos[1] > 60 and not reset_btn.rect.collidepoint(event.pos) and not mode_btn.rect.collidepoint(event.pos):
+                    new_goal = pygame.math.Vector2(event.pos)
+                    # Optimize calculation via threshold to maintain performance
+                    if new_goal.distance_to(goal_pos) > CELL_SIZE / 2:
+                        # Prevent overlapping the goal onto an obstacle
+                        valid = True
+                        temp_rect = pygame.Rect(new_goal.x-10, new_goal.y-10, 20, 20)
+                        for obs in obstacles:
+                            if temp_rect.colliderect(obs.rect):
+                                valid = False
+                                break
+                        
+                        if valid:
+                            goal_pos = new_goal
+                            active_path = Pathfinding.a_star(wheelchair.pos, goal_pos, obstacles)
+                            wheelchair.path_index = 0
+
+        # --- PHASE 2: UPDATE LOGIC --- 
+        if mode == "MANUAL":
+            keys = pygame.key.get_pressed()
+            wheelchair.move_manual(keys, obstacles)
+        elif mode == "AUTO":
+            # Just generate initial path if we don't have one and we aren't stopped
+            if not active_path and not wheelchair.emergency_stop:
+                active_path = Pathfinding.a_star(wheelchair.pos, goal_pos, obstacles)
+                wheelchair.path_index = 0
+            wheelchair.move_auto(active_path, obstacles)
+
+        # --- PHASE 3: DRAWING --- 
+        screen.fill(LIGHT_GRAY)
+
+        # Draw Grid (Mappable via User input 'G')
+        if show_grid:
+            for x in range(0, WIDTH, CELL_SIZE):
+                pygame.draw.line(screen, DARK_GRAY, (x, 0), (x, HEIGHT))
+            for y in range(0, HEIGHT, CELL_SIZE):
+                pygame.draw.line(screen, DARK_GRAY, (0, y), (WIDTH, y))
+
+        # Render Environment
+        for obs in obstacles:
+            obs.draw(screen)
+
+        # Draw Goal Box
+        pygame.draw.rect(screen, GREEN, (goal_pos.x - 10, goal_pos.y - 10, 20, 20), border_radius=5)
+        pygame.draw.rect(screen, BLACK, (goal_pos.x - 10, goal_pos.y - 10, 20, 20), 2, border_radius=5)
+
+        # Draw Planned Route Lines (Path Memory Visualization)
+        if mode == "AUTO" and active_path and not wheelchair.emergency_stop:
+            # Slice current path segment to draw only what is left
+            path_points = [wheelchair.pos] + active_path[wheelchair.path_index:]
+            if len(path_points) > 1:
+                pygame.draw.lines(screen, PATH_COLOR, False, path_points, 3)
+
+        # Render the Wheelchair
+        wheelchair.draw(screen)
+
+        # Draw Top UI Bar
+        pygame.draw.rect(screen, (40, 40, 40), (0, 0, WIDTH, 60))
+        pygame.draw.rect(screen, (20, 20, 20), (0, 60, WIDTH, 2))
+
+        mode_btn.text = f"MODE: {mode}"
+        mode_btn.draw(screen, font)
+        reset_btn.draw(screen, font)
+
+        # Draw instructions text on top bar
+        inst_text = font.render("[M] Toggle / [G] Grid - Click or drag to move target", True, LIGHT_GRAY)
+        screen.blit(inst_text, (180, 20))
+
+        # Alert Overrides
+        goal_rect = pygame.Rect(goal_pos.x - 10, goal_pos.y - 10, 20, 20)
+
+        if wheelchair.emergency_stop:
+            # Full width red translucent visual alert overlay
+            alert_surf = pygame.Surface((WIDTH, 80), pygame.SRCALPHA)
+            alert_surf.fill((255, 0, 0, 220))
+            screen.blit(alert_surf, (0, HEIGHT//2 - 40))
+            
+            # Massive Alert Text
+            alert_text = big_font.render("EMERGENCY STOP - COLLISION", True, WHITE)
+            alert_rect = alert_text.get_rect(center=(WIDTH//2, HEIGHT//2))
+            screen.blit(alert_text, alert_rect)
+        elif wheelchair.rect.colliderect(goal_rect):
+            # Destination Reached
+            alert_surf = pygame.Surface((WIDTH, 80), pygame.SRCALPHA)
+            alert_surf.fill((0, 200, 50, 220))  # Green banner
+            screen.blit(alert_surf, (0, HEIGHT//2 - 40))
+            
+            alert_text = big_font.render("DESTINATION REACHED", True, WHITE)
+            alert_rect = alert_text.get_rect(center=(WIDTH//2, HEIGHT//2))
+            screen.blit(alert_text, alert_rect)
+
+        # Present the compiled screen buffers
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
